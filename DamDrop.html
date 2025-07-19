@@ -1,0 +1,163 @@
+<!DOCTYPE html><html>
+<head>
+  <meta charset="UTF-8">
+  <title>QR WebRTC Chunked File Transfer</title>
+  <style>
+    body { font-family: sans-serif; margin: 1em; }
+    video { width: 300px; border: 1px solid black; }
+    canvas { margin-top: 10px; }
+    textarea { width: 100%; height: 100px; }
+    #downloadArea, #statusArea { margin-top: 1em; }
+  </style>
+</head>
+<body>
+  <h2>📤 파일 전송 (Sender)</h2>
+  <input type="file" id="fileInput" multiple>
+  <button id="createOffer">📦 Offer 만들기</button>
+  <canvas id="qrCanvas"></canvas>
+  <div id="statusArea"></div>  <h2>📥 파일 수신 (Receiver)</h2>
+  <button id="scanQR">📷 QR 스캔</button>
+  <video id="video" autoplay></video>  <textarea id="answerInput" placeholder="상대방의 answer 붙여넣기"></textarea><button id="setAnswer">📥 Answer 적용</button>
+
+  <div id="downloadArea"></div>  <script src="https://cdn.jsdelivr.net/npm/qrcode-generator/qrcode.js"></script>  <script src="https://cdn.jsdelivr.net/npm/jsqr/dist/jsQR.js"></script>  <script>
+    let peerConn;
+    let dataChannel;
+    let filesToSend = [];
+
+    const CHUNK_SIZE = 16 * 1024; // 16KB
+
+    const fileInput = document.getElementById('fileInput');
+    const qrCanvas = document.getElementById('qrCanvas');
+    const video = document.getElementById('video');
+    const answerInput = document.getElementById('answerInput');
+    const downloadArea = document.getElementById('downloadArea');
+    const statusArea = document.getElementById('statusArea');
+
+    function updateStatus(text) {
+      statusArea.textContent = text;
+    }
+
+    fileInput.addEventListener('change', e => {
+      filesToSend = Array.from(e.target.files);
+    });
+
+    document.getElementById('createOffer').addEventListener('click', async () => {
+      peerConn = new RTCPeerConnection();
+      dataChannel = peerConn.createDataChannel('file');
+
+      dataChannel.onopen = async () => {
+        for (let file of filesToSend) {
+          updateStatus(`전송 시작: ${file.name}`);
+          dataChannel.send(JSON.stringify({ filename: file.name, size: file.size }));
+          const buffer = await file.arrayBuffer();
+          let sent = 0;
+          for (let offset = 0; offset < buffer.byteLength; offset += CHUNK_SIZE) {
+            const chunk = buffer.slice(offset, offset + CHUNK_SIZE);
+            dataChannel.send(chunk);
+            sent += chunk.byteLength;
+            updateStatus(`전송 중: ${file.name} (${Math.min(((sent / buffer.byteLength) * 100), 100).toFixed(1)}%)`);
+            await new Promise(res => setTimeout(res, 10));
+          }
+          dataChannel.send("EOF");
+          updateStatus(`전송 완료: ${file.name}`);
+        }
+      };
+
+      const offer = await peerConn.createOffer();
+      await peerConn.setLocalDescription(offer);
+      peerConn.onicecandidate = () => {
+        if (peerConn.iceGatheringState === 'complete') {
+          const encoded = btoa(JSON.stringify(peerConn.localDescription));
+          const qr = qrcode(0, 'L');
+          qr.addData(encoded);
+          qr.make();
+          qrCanvas.width = 256;
+          qrCanvas.height = 256;
+          const ctx = qrCanvas.getContext('2d');
+          ctx.clearRect(0, 0, 256, 256);
+          const cellSize = 256 / qr.getModuleCount();
+          for (let row = 0; row < qr.getModuleCount(); row++) {
+            for (let col = 0; col < qr.getModuleCount(); col++) {
+              ctx.fillStyle = qr.isDark(row, col) ? 'black' : 'white';
+              ctx.fillRect(col * cellSize, row * cellSize, cellSize, cellSize);
+            }
+          }
+        }
+      };
+    });
+
+    document.getElementById('scanQR').addEventListener('click', async () => {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' } });
+      video.srcObject = stream;
+      const scan = () => {
+        const canvas = document.createElement('canvas');
+        canvas.width = video.videoWidth;
+        canvas.height = video.videoHeight;
+        canvas.getContext('2d').drawImage(video, 0, 0);
+        const imageData = canvas.getContext('2d').getImageData(0, 0, canvas.width, canvas.height);
+        const code = jsQR(imageData.data, canvas.width, canvas.height);
+        if (code) {
+          stream.getTracks().forEach(track => track.stop());
+          handleOffer(code.data);
+        } else {
+          requestAnimationFrame(scan);
+        }
+      };
+      requestAnimationFrame(scan);
+    });
+
+    async function handleOffer(encodedOffer) {
+      const offer = JSON.parse(atob(encodedOffer));
+      peerConn = new RTCPeerConnection();
+      peerConn.ondatachannel = e => {
+        const receiveChannel = e.channel;
+        let currentFile = null;
+        let receivedBuffers = [];
+        let receivedBytes = 0;
+
+        receiveChannel.onmessage = e => {
+          if (typeof e.data === 'string') {
+            if (e.data === 'EOF') {
+              const blob = new Blob(receivedBuffers);
+              const a = document.createElement('a');
+              a.href = URL.createObjectURL(blob);
+              a.download = currentFile.filename;
+              a.textContent = `📥 ${a.download} 다운로드`;
+              downloadArea.appendChild(a);
+              updateStatus(`수신 완료: ${currentFile.filename}`);
+              receivedBuffers = [];
+              receivedBytes = 0;
+              currentFile = null;
+            } else {
+              currentFile = JSON.parse(e.data);
+              receivedBuffers = [];
+              receivedBytes = 0;
+              updateStatus(`수신 시작: ${currentFile.filename}`);
+            }
+          } else {
+            receivedBuffers.push(e.data);
+            receivedBytes += e.data.byteLength;
+            if (currentFile && currentFile.size > 0) {
+              const percent = (receivedBytes / currentFile.size) * 100;
+              updateStatus(`수신 중: ${currentFile.filename} (${percent.toFixed(1)}%)`);
+            }
+          }
+        };
+      };
+      await peerConn.setRemoteDescription(offer);
+      const answer = await peerConn.createAnswer();
+      await peerConn.setLocalDescription(answer);
+      peerConn.onicecandidate = () => {
+        if (peerConn.iceGatheringState === 'complete') {
+          const encoded = btoa(JSON.stringify(peerConn.localDescription));
+          answerInput.value = encoded;
+        }
+      };
+    }
+
+    document.getElementById('setAnswer').addEventListener('click', async () => {
+      const answer = JSON.parse(atob(answerInput.value));
+      await peerConn.setRemoteDescription(answer);
+    });
+  </script></body>
+</html>
